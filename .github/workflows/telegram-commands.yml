@@ -1,0 +1,46 @@
+name: Telegram Bot Commands
+
+on:
+  schedule:
+    - cron: "*/15 * * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+# Shared with the YouTube workflow to avoid two jobs changing the history at once.
+concurrency:
+  group: youtube-telegram-announcer
+  cancel-in-progress: false
+
+jobs:
+  commands:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - name: Download project
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Process private Telegram commands
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+        run: python youtube_telegram_announcer.py --commands-once
+
+      - name: Save command offset and video history
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add telegram_update_offset.txt posted_videos.txt
+          if ! git diff --cached --quiet; then
+            git commit -m "Update Telegram command offset and video history"
+            git push
+          fi
