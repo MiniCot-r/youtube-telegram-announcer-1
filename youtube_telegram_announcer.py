@@ -36,6 +36,10 @@ BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 # with permission to post messages.
 CHANNEL_ID = "-1002363892622"
 
+# Only this Telegram account may use bot commands. Other users are ignored.
+AUTHORIZED_USER_ID = 1454026540
+COMMAND_CHAT_ID = str(AUTHORIZED_USER_ID)
+
 # YouTube channel RSS feed.
 RSS_URL = "https://www.youtube.com/feeds/videos.xml?channel_id=UCiJs4ibVRUobi5GRpjI28UQ"
 
@@ -57,11 +61,12 @@ MESSAGE_HEADER_SHORTS = "⚡ <b>НОВЫЙ YOUTUBE SHORTS!</b>"
 # Footer is optional. You can add your own hashtags and valid Telegram HTML.
 MESSAGE_FOOTER = "Залетай смотреть и поддержи просмотром!\n\n#новое_видео #YouTube"
 
-# Keep the preview enabled so Telegram can show the YouTube thumbnail/player preview.
-ENABLE_LINK_PREVIEW = True
+# Posts use a YouTube thumbnail as a Telegram photo with an inline button.
+# If the high-resolution thumbnail is unavailable, the sender falls back to hqdefault.
 
 # History file is saved next to this script, not to the current working directory.
 POSTED_IDS_FILE = BASE_DIR / "posted_videos.txt"
+TELEGRAM_OFFSET_FILE = BASE_DIR / "telegram_update_offset.txt"
 
 # ---------------------------------------------------------------------------
 # LOGGING
@@ -203,84 +208,259 @@ def remember_posted_video(video_id: str) -> None:
 # ---------------------------------------------------------------------------
 
 def build_telegram_message(entry: Any, video_id: str) -> str:
-    """Format a neat Telegram post using HTML parse mode."""
+    """Build a compact caption for a thumbnail-based Telegram channel post."""
     title = str(entry.get("title", "Новое видео") or "Новое видео").strip()
     shorts = is_probably_shorts(entry, title)
-    video_url = build_video_url(video_id, shorts)
-
-    # Escape the YouTube title to prevent accidental/broken Telegram HTML.
-    safe_title = html.escape(title)
-    safe_url = html.escape(video_url, quote=True)
     header = MESSAGE_HEADER_SHORTS if shorts else MESSAGE_HEADER
 
-    message_parts = [
-        header,
-        f"<b>{safe_title}</b>",
-        f'<a href="{safe_url}">▶️ Смотреть на YouTube</a>',
-    ]
+    # Telegram photo captions have a 1024-character limit after parsing.
+    max_title_length = 700
+    if len(title) > max_title_length:
+        title = title[: max_title_length - 1].rstrip() + "…"
+
+    parts = [header, f"<b>{html.escape(title)}</b>"]
     if MESSAGE_FOOTER.strip():
-        message_parts.append(MESSAGE_FOOTER.strip())
-
-    message = "\n\n".join(message_parts)
-    if len(message) > 4096:
-        # Telegram's sendMessage text limit is 4096 characters after parsing.
-        # RSS titles are normally short; this is a defensive fallback.
-        overflow = len(message) - 4096
-        shorter_title = title[: max(20, len(title) - overflow - 10)] + "…"
-        safe_title = html.escape(shorter_title)
-        message_parts[1] = f"<b>{safe_title}</b>"
-        message = "\n\n".join(message_parts)
-
+        parts.append(MESSAGE_FOOTER.strip())
+    message = "\n\n".join(parts)
+    if len(message) > 1024:
+        # Keep the post valid even if the configured footer is unusually long.
+        message = message[:1000].rstrip()
     return message
 
 
-def send_telegram_message(message: str) -> None:
-    """Send a message with retries for temporary network/server/rate-limit errors."""
-    api_url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
-    payload = {
-        "chat_id": CHANNEL_ID,
-        "text": message,
-        "parse_mode": "HTML",
-        "disable_web_page_preview": not ENABLE_LINK_PREVIEW,
-    }
-
-    for attempt in range(1, MAX_TELEGRAM_ATTEMPTS + 1):
-        try:
-            response = requests.post(api_url, json=payload, timeout=REQUEST_TIMEOUT_SECONDS)
-        except requests.RequestException as exc:
-            if attempt >= MAX_TELEGRAM_ATTEMPTS:
-                raise RuntimeError(f"Ошибка соединения с Telegram: {exc}") from exc
-            delay = min(2 ** attempt, 20)
-            logger.warning("Ошибка сети Telegram; повтор через %s сек. (%s/%s)", delay, attempt, MAX_TELEGRAM_ATTEMPTS)
-            time.sleep(delay)
-            continue
-
+def send_telegram_message(message: str, video_id: str | None = None, shorts: bool = False) -> None:
+    """Send a thumbnail post with a YouTube button, retrying transient errors."""
+    if not video_id:
+        # Compatibility fallback for any plain-text announcement call.
+        api_url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
+        payload = {
+            "chat_id": CHANNEL_ID,
+            "text": message,
+            "parse_mode": "HTML",
+            "disable_web_page_preview": True,
+        }
+        response = requests.post(api_url, json=payload, timeout=REQUEST_TIMEOUT_SECONDS)
         try:
             result = response.json()
         except ValueError:
             result = {}
+        if not response.ok or not result.get("ok"):
+            raise RuntimeError(f"Telegram API вернул ошибку: {result.get('description', response.text[:500])}")
+        return
 
-        if response.status_code == 429:
-            retry_after = result.get("parameters", {}).get("retry_after", 5)
-            if attempt < MAX_TELEGRAM_ATTEMPTS:
-                delay = max(1, int(retry_after))
-                logger.warning("Telegram ограничил частоту; повтор через %s сек.", delay)
+    video_url = build_video_url(video_id, shorts)
+    api_url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendPhoto"
+    payload = {
+        "chat_id": CHANNEL_ID,
+        "caption": message,
+        "parse_mode": "HTML",
+        "reply_markup": {
+            "inline_keyboard": [[{"text": "▶ Смотреть на YouTube", "url": video_url}]]
+        },
+    }
+
+    # maxresdefault is widescreen and crisp when available; hqdefault is the reliable fallback.
+    thumbnail_urls = [
+        f"https://i.ytimg.com/vi/{video_id}/maxresdefault.jpg",
+        f"https://i.ytimg.com/vi/{video_id}/hqdefault.jpg",
+    ]
+    last_error = "неизвестная ошибка"
+    for thumbnail_url in thumbnail_urls:
+        photo_payload = {**payload, "photo": thumbnail_url}
+        for attempt in range(1, MAX_TELEGRAM_ATTEMPTS + 1):
+            try:
+                response = requests.post(api_url, json=photo_payload, timeout=REQUEST_TIMEOUT_SECONDS)
+            except requests.RequestException as exc:
+                last_error = str(exc)
+                if attempt >= MAX_TELEGRAM_ATTEMPTS:
+                    break
+                delay = min(2 ** attempt, 20)
+                logger.warning("Ошибка сети Telegram; повтор через %s сек. (%s/%s)", delay, attempt, MAX_TELEGRAM_ATTEMPTS)
                 time.sleep(delay)
                 continue
 
-        if response.status_code >= 500 and attempt < MAX_TELEGRAM_ATTEMPTS:
-            delay = min(2 ** attempt, 20)
-            logger.warning("Ошибка сервера Telegram (%s); повтор через %s сек.", response.status_code, delay)
-            time.sleep(delay)
-            continue
+            try:
+                result = response.json()
+            except ValueError:
+                result = {}
 
-        if not response.ok or not result.get("ok"):
-            description = result.get("description", response.text[:500])
-            raise RuntimeError(f"Telegram API вернул ошибку: {description}")
+            if response.ok and result.get("ok"):
+                return
 
+            last_error = result.get("description", response.text[:500])
+            if response.status_code == 429 and attempt < MAX_TELEGRAM_ATTEMPTS:
+                delay = max(1, int(result.get("parameters", {}).get("retry_after", 5)))
+                logger.warning("Telegram ограничил частоту; повтор через %s сек.", delay)
+                time.sleep(delay)
+                continue
+            if response.status_code >= 500 and attempt < MAX_TELEGRAM_ATTEMPTS:
+                delay = min(2 ** attempt, 20)
+                logger.warning("Ошибка сервера Telegram (%s); повтор через %s сек.", response.status_code, delay)
+                time.sleep(delay)
+                continue
+            # A bad/missing max-resolution image should not prevent the post;
+            # move to hqdefault. Other errors will also get one safe fallback attempt.
+            break
+
+    # Last resort: publish text with the button if Telegram cannot fetch either image.
+    fallback_payload = {
+        "chat_id": CHANNEL_ID,
+        "text": message,
+        "parse_mode": "HTML",
+        "reply_markup": payload["reply_markup"],
+        "disable_web_page_preview": True,
+    }
+    fallback_response = requests.post(
+        f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
+        json=fallback_payload,
+        timeout=REQUEST_TIMEOUT_SECONDS,
+    )
+    try:
+        fallback_result = fallback_response.json()
+    except ValueError:
+        fallback_result = {}
+    if not fallback_response.ok or not fallback_result.get("ok"):
+        raise RuntimeError(
+            "Не удалось отправить пост с обложкой или текстовый запасной вариант: "
+            f"{fallback_result.get('description', last_error)}"
+        )
+    logger.warning("Опубликован текстовый пост без обложки: %s", last_error)
+
+
+# ---------------------------------------------------------------------------
+# PRIVATE TELEGRAM COMMANDS (run once from a scheduled GitHub Actions job)
+# ---------------------------------------------------------------------------
+
+def send_command_reply(chat_id: str | int, message: str) -> None:
+    """Send a plain-text reply to the authorized user's private chat."""
+    api_url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
+    response = requests.post(
+        api_url,
+        json={"chat_id": chat_id, "text": message, "disable_web_page_preview": True},
+        timeout=REQUEST_TIMEOUT_SECONDS,
+    )
+    try:
+        result = response.json()
+    except ValueError:
+        result = {}
+    if not response.ok or not result.get("ok"):
+        raise RuntimeError(f"Не удалось ответить на команду Telegram: {result.get('description', response.text[:300])}")
+
+
+def read_update_offset() -> int:
+    """Read the next Telegram update ID to request; defaults to the beginning."""
+    try:
+        raw = TELEGRAM_OFFSET_FILE.read_text(encoding="utf-8").strip()
+        return max(0, int(raw)) if raw else 0
+    except FileNotFoundError:
+        return 0
+    except (OSError, ValueError) as exc:
+        raise RuntimeError(f"Не удалось прочитать {TELEGRAM_OFFSET_FILE}: {exc}") from exc
+
+
+def save_update_offset(offset: int) -> None:
+    """Persist the next update ID so scheduled runs don't repeat commands."""
+    temp_file = TELEGRAM_OFFSET_FILE.with_name(TELEGRAM_OFFSET_FILE.name + ".tmp")
+    temp_file.write_text(f"{offset}\n", encoding="utf-8")
+    temp_file.replace(TELEGRAM_OFFSET_FILE)
+
+
+def get_last_posted_video() -> tuple[str, str] | None:
+    """Return the newest RSS video that is already recorded as posted."""
+    posted_ids = read_history()
+    for entry in fetch_feed_entries():
+        video_id = extract_video_id(entry)
+        if video_id and video_id in posted_ids:
+            title = str(entry.get("title", "Новое видео") or "Новое видео").strip()
+            shorts = is_probably_shorts(entry, title)
+            return title, build_video_url(video_id, shorts)
+    return None
+
+
+def handle_private_command(chat_id: str | int, command_text: str) -> None:
+    """Run one allowlisted command and reply to the authorized private chat."""
+    command = command_text.strip().split()[0].split("@", 1)[0].lower() if command_text.strip() else ""
+
+    if command in ("/start", "/help"):
+        send_command_reply(
+            chat_id,
+            "Привет! Я бот-анонсер MiniCot.\n\n"
+            "/status — состояние бота и число сохранённых видео\n"
+            "/check — проверить YouTube прямо сейчас\n"
+            "/last — последнее опубликованное видео\n"
+            "/help — список команд",
+        )
+    elif command == "/status":
+        send_command_reply(
+            chat_id,
+            "Бот работает.\n"
+            f"Видео в истории: {len(read_history())}\n"
+            "Проверка YouTube по расписанию: примерно раз в 30 минут.\n"
+            "Команды проверяются примерно раз в 15 минут.",
+        )
+    elif command == "/check":
+        try:
+            check_for_new_videos()
+            send_command_reply(chat_id, "Проверка YouTube завершена. Если появилось новое видео, я отправил пост в канал.")
+        except Exception as exc:
+            logger.exception("Ошибка при выполнении команды /check")
+            send_command_reply(chat_id, f"Не удалось проверить YouTube: {str(exc)[:700]}")
+    elif command == "/last":
+        try:
+            latest = get_last_posted_video()
+            if latest:
+                title, url = latest
+                send_command_reply(chat_id, f"Последнее опубликованное видео:\n{title}\n{url}")
+            else:
+                send_command_reply(chat_id, "В истории пока нет опубликованных видео.")
+        except Exception as exc:
+            logger.exception("Ошибка при выполнении команды /last")
+            send_command_reply(chat_id, f"Не удалось получить последнее видео: {str(exc)[:700]}")
+    else:
+        send_command_reply(chat_id, "Неизвестная команда. Напиши /help, чтобы увидеть список команд.")
+
+
+def process_telegram_commands_once() -> None:
+    """Fetch pending updates; fully ignore users other than the configured owner."""
+    offset = read_update_offset()
+    api_url = f"https://api.telegram.org/bot{BOT_TOKEN}/getUpdates"
+    response = requests.get(
+        api_url,
+        params={"offset": offset, "limit": 100, "timeout": 0, "allowed_updates": '["message"]'},
+        timeout=REQUEST_TIMEOUT_SECONDS,
+    )
+    response.raise_for_status()
+    result = response.json()
+    if not result.get("ok"):
+        raise RuntimeError(f"Telegram getUpdates вернул ошибку: {result.get('description', 'неизвестная ошибка')}")
+
+    updates = result.get("result", [])
+    if not updates:
+        logger.info("Новых Telegram-команд нет.")
         return
 
-    raise RuntimeError("Не удалось отправить сообщение в Telegram после нескольких попыток.")
+    for update in updates:
+        update_id = int(update.get("update_id", 0))
+        message = update.get("message") or {}
+        sender = message.get("from") or {}
+        chat = message.get("chat") or {}
+        text = str(message.get("text", "") or "").strip()
+
+        # Only process messages sent by the owner in their private chat.
+        # All other users/chats are silently ignored, but their update IDs are
+        # advanced so they don't remain queued forever.
+        if (int(sender.get("id", 0) or 0) == AUTHORIZED_USER_ID
+                and str(chat.get("type", "")) == "private"
+                and str(chat.get("id", "")) == COMMAND_CHAT_ID
+                and text.startswith("/")):
+            handle_private_command(chat["id"], text)
+        else:
+            logger.info("Пропущено обновление Telegram без ответа (не владелец или не личный чат).")
+
+        offset = update_id + 1
+        save_update_offset(offset)
+
+    logger.info("Обработано обновлений Telegram: %s", len(updates))
 
 
 # ---------------------------------------------------------------------------
@@ -323,10 +503,11 @@ def check_for_new_videos() -> None:
 
         title = str(entry.get("title", "Новое видео") or "Новое видео").strip()
         message = build_telegram_message(entry, video_id)
+        shorts = is_probably_shorts(entry, title)
 
         # Save the ID only after Telegram confirms the post was sent.
         # If sending fails, the ID remains unrecorded and will be retried next poll.
-        send_telegram_message(message)
+        send_telegram_message(message, video_id=video_id, shorts=shorts)
         remember_posted_video(video_id)
         posted_ids.add(video_id)
         logger.info("Опубликовано: %s (ID: %s)", title, video_id)
@@ -349,6 +530,14 @@ def main() -> None:
         raise SystemExit("CHECK_INTERVAL_MINUTES должен быть положительным числом.")
 
     logger.info("Файл истории: %s", POSTED_IDS_FILE)
+
+    if "--commands-once" in sys.argv:
+        try:
+            process_telegram_commands_once()
+        except Exception:
+            logger.exception("Ошибка обработки Telegram-команд.")
+            raise SystemExit(1)
+        return
 
     # --once performs exactly one RSS check and exits. This is useful for
     # scheduled services such as GitHub Actions, where each run is a fresh VM.
