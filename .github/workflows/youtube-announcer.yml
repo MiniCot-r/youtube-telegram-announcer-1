@@ -3,7 +3,7 @@ name: YouTube Telegram Announcer
 
 on:
   schedule:
-    - cron: "3,33 * * * *"
+    - cron: "*/5 * * * *"
   workflow_dispatch:
 
 permissions:
