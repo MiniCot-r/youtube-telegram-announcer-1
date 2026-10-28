@@ -2,7 +2,7 @@ name: Telegram Bot Commands
 
 on:
   schedule:
-    - cron: "*/5 * * * *"
+    - cron: "*/7 * * * *"
   workflow_dispatch:
 
 permissions:
